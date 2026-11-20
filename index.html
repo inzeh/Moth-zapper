@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#140a23">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon-192.png">
+<title>Costume Strobe</title>
+<style>
+  body { font-family: sans-serif; background: #140a23; color: #eee; padding: 16px; max-width: 440px; margin: auto; }
+  h2 { margin: 4px 0 12px; }
+  button { width: 100%; padding: 16px; margin: 6px 0; font-size: 18px; border: 0; border-radius: 10px; background: #7b2cbf; color: #fff; }
+  button:disabled { background: #444; }
+  #strobeNow { background: #fff; color: #5a189a; font-weight: bold; font-size: 22px; padding: 22px; }
+  #stop { background: #333; }
+  label { display: block; margin-top: 12px; }
+  input[type=number] { width: 100%; padding: 10px; font-size: 18px; box-sizing: border-box; }
+  input[type=range] { width: 100%; }
+  .row { display: flex; align-items: center; gap: 10px; margin-top: 12px; font-size: 18px; }
+  .row input { width: 22px; height: 22px; }
+  #meter { height: 14px; background: #333; border-radius: 7px; overflow: hidden; margin-top: 6px; position: relative; }
+  #bar { height: 100%; width: 0; background: #b388ff; }
+  #thresh { position: absolute; top: 0; bottom: 0; width: 3px; background: #fff; }
+  #status { margin-top: 14px; color: #bbb; }
+</style>
+</head>
+<body>
+<h2>Costume Strobe</h2>
+
+<button id="connect">1. Connect to strip</button>
+<button id="start" disabled>2. Start</button>
+<button id="strobeNow" disabled>STROBE NOW</button>
+<button id="stop" disabled>Stop (lights off)</button>
+
+<div class="row"><input type="checkbox" id="auto" checked><label for="auto" style="margin:0">Auto cycle (solid then strobe)</label></div>
+<label>Solid seconds <input id="solid" type="number" value="10" min="1"></label>
+<label>Strobe seconds <input id="strobe" type="number" value="3" min="1"></label>
+<label>Flash interval (ms) <input id="interval" type="number" value="100" min="50"></label>
+
+<div class="row"><input type="checkbox" id="micOn"><label for="micOn" style="margin:0">Microphone trigger</label></div>
+<label>Mic sensitivity (higher = triggers on quieter sounds)
+  <input id="sens" type="range" min="1" max="100" value="60"></label>
+<div id="meter"><div id="bar"></div><div id="thresh"></div></div>
+
+<div id="status">Not connected</div>
+
+<script>
+const SERVICE = 0xfff0, CHAR = 0xfff3;
+const PURPLE = new Uint8Array([0x7E,0x07,0x05,0x03,0x80,0x00,0xFF,0x10,0xEF]);
+const WHITE  = new Uint8Array([0x7E,0x07,0x05,0x03,0xFF,0xFF,0xFF,0x10,0xEF]);
+const OFF    = new Uint8Array([0x7E,0x07,0x05,0x03,0x00,0x00,0x00,0x10,0xEF]);
+
+const $ = id => document.getElementById(id);
+const status = t => $('status').textContent = t;
+
+let device, characteristic, timer, wakeLock, busy = false;
+let running = false, startTime = 0, strobeUntil = 0, cooldownUntil = 0;
+let flip = 0, wasStrobing = false, lastSend = 0;
+let audioCtx, analyser, micStream, micData;
+
+async function send(data) {
+  if (!characteristic || busy) return;
+  busy = true;
+  try { await characteristic.writeValueWithoutResponse(data); }
+  catch (e) { try { await characteristic.writeValue(data); } catch (e2) { status('Write error: ' + e2.message); } }
+  busy = false;
+}
+
+$('connect').onclick = async () => {
+  try {
+    status('Choose your MELK-OA10...');
+    device = await navigator.bluetooth.requestDevice({ filters: [{ namePrefix: 'MELK' }], optionalServices: [SERVICE] });
+    device.addEventListener('gattserverdisconnected', () => {
+      status('Disconnected - tap Connect again');
+      stopAll(false);
+      $('start').disabled = true; $('strobeNow').disabled = true; $('stop').disabled = true;
+    });
+    const server = await device.gatt.connect();
+    const service = await server.getPrimaryService(SERVICE);
+    characteristic = await service.getCharacteristic(CHAR);
+    status('Connected. Close the official app if it does not respond.');
+    $('start').disabled = false; $('strobeNow').disabled = false; $('stop').disabled = false;
+    await send(PURPLE);
+  } catch (e) { status('Error: ' + e.message); }
+};
+
+function strobeMs() { return Math.max(1, +$('strobe').value) * 1000; }
+
+function triggerStrobe() {
+  const now = performance.now();
+  strobeUntil = now + strobeMs();
+}
+
+$('strobeNow').onclick = () => { if (!running) startLoop(); triggerStrobe(); };
+
+function tick() {
+  const now = performance.now();
+  const solidMs = Math.max(1, +$('solid').value) * 1000;
+  const total = solidMs + strobeMs();
+  let strobing = now < strobeUntil;
+  if ($('auto').checked) {
+    const pos = (now - startTime) % total;
+    if (pos >= solidMs) strobing = true;
+  }
+  if (strobing) {
+    send(flip++ % 2 === 0 ? WHITE : PURPLE);
+    wasStrobing = true;
+    lastSend = now;
+  } else {
+    if (wasStrobing || now - lastSend > 2000) {
+      send(PURPLE);
+      wasStrobing = false;
+      lastSend = now;
+    }
+  }
+  micCheck(now, strobing);
+}
+
+function micCheck(now, strobing) {
+  if (!analyser) return;
+  analyser.getByteTimeDomainData(micData);
+  let sum = 0;
+  for (let i = 0; i < micData.length; i++) { const v = (micData[i] - 128) / 128; sum += v * v; }
+  const level = Math.min(1, Math.sqrt(sum / micData.length) * 4);
+  $('bar').style.width = (level * 100) + '%';
+  const threshold = 1 - (+$('sens').value / 100) * 0.95;
+  $('thresh').style.left = (threshold * 100) + '%';
+  if ($('micOn').checked && !strobing && now > cooldownUntil && level > threshold) {
+    triggerStrobe();
+    cooldownUntil = now + strobeMs() + 1000;
+  }
+}
+
+async function startLoop() {
+  clearInterval(timer);
+  running = true;
+  startTime = performance.now();
+  flip = 0; wasStrobing = false;
+  try { wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
+  const interval = Math.max(50, +$('interval').value);
+  timer = setInterval(tick, interval);
+  status('Running');
+}
+
+$('start').onclick = startLoop;
+
+async function stopAll(sendOff = true) {
+  clearInterval(timer);
+  running = false;
+  strobeUntil = 0;
+  if (wakeLock) { try { wakeLock.release(); } catch (e) {} wakeLock = null; }
+  if (sendOff) { await send(OFF); status('Stopped'); }
+}
+$('stop').onclick = () => stopAll(true);
+
+$('micOn').onchange = async () => {
+  if ($('micOn').checked) {
+    try {
+      micStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const src = audioCtx.createMediaStreamSource(micStream);
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 1024;
+      micData = new Uint8Array(analyser.fftSize);
+      src.connect(analyser);
+      if (!running) status('Mic ready. Tap Start to begin listening.');
+    } catch (e) { status('Mic error: ' + e.message); $('micOn').checked = false; }
+  } else {
+    if (micStream) micStream.getTracks().forEach(t => t.stop());
+    if (audioCtx) audioCtx.close();
+    analyser = null; $('bar').style.width = '0';
+  }
+};
+
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+</script>
+</body>
+</html>
